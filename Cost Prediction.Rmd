@@ -1,0 +1,543 @@
+---
+title: "Attempting to Predict Medical Costs"
+author: "Matt Dunham"
+output: html_document
+---
+```{r echo=TRUE}
+knitr::opts_chunk$set(
+	message = FALSE,
+	warnings = FALSE
+)
+```
+
+```{r echo=TRUE}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(reshape2)
+library(viridis)
+library(caret)
+library(car)
+library(MVN)
+library(pROC)
+
+set.seed(3999)
+```
+
+In this project, I use a dataset on medical costs that contains the total medical costs of individuals with a variety of different factors. Here is a breakdown of our variables:
+
+* **age**: age of primary beneficiary
+
+* **sex**: insurance contractor gender, female, male
+
+* **bmi**: Body mass index, providing an understanding of body, weights that are relatively high or low relative to height, objective index of body weight (kg / m ^ 2) using the ratio of height to weight, ideally 18.5 to 24.9
+
+* **children**: Number of children covered by health insurance / Number of dependents
+
+* **smoker**: Smoking
+
+* **region**: the beneficiary's residential area in the US, northeast, southeast, southwest, northwest.
+
+* **charges**: Individual medical costs billed by health insurance
+
+Now, we'll proceed with taking a look at and cleaning our data.
+
+# **Data Investigation**
+
+For our data investigation, we'll take a look at our data, the structure of our data and look to see if there are any interesting relationships that exist. We'll also create some visualizations to further investigate these relationships, with a particlar interest on how variables relate to medical costs.
+
+## **Data Cleaning**
+
+First, let's just take a look at our data to see the variables we have, whether they are numeric or categorical, and the levels of any categorical variables we have.
+
+```{r}
+insurance_raw <- read_csv("insurance.csv") 
+
+head(insurance_raw)
+
+unique(insurance_raw$sex); unique(insurance_raw$smoker); unique(insurance_raw$region)
+```
+
+Here, we can see that we have 3 categorical variables - a few binary (sex and smoker status), and one with multiple levels (region). Something I'm curious about, is looking at BMI a little deeper to see if we have any BMI values that are greater than 30. I'm curious about this, because a BMI larger than 30 indicates an individual is obese, which could play some importance in their medical costs.
+
+```{r}
+
+hist(insurance_raw$bmi)
+
+```
+
+Wow.. It appears that almost half of the invidiuals in this dataset could be categorized as having obesity. Seems like it would be wise to create another variable to make this categorization since so many are affected by this in our data.
+
+```{r}
+
+insurance_raw <- insurance_raw %>% mutate(obesity = ifelse(bmi >= 30, "yes", "no")) %>% relocate(obesity, .before = charges)
+
+```
+
+Lastly, let's go ahead and check for any NA values in our data to see if we need to remove any rows, or take a deeper look at missing values.
+
+```{r}
+
+sum(is.na(insurance_raw))
+
+```
+
+Ahh, a dream - nothing is missing! There won't be much to do in terms of data cleaning (woohoo!), but we'll probably want to recode some of our categorical varibles to help with a few calculations down the road.
+
+```{r}
+
+insurance_clean <- insurance_raw %>%
+  mutate(sex = ifelse(sex == "female", 1, 0)) %>%
+  mutate(smoker = ifelse(smoker == "yes", 1, 0)) %>%
+  mutate(region = case_when(region == "southwest" ~ "1",
+                            region == "southeast" ~ "2",
+                            region == "northwest" ~ "3",
+                            region == "northeast" ~ "4")) %>%
+  mutate(region = as.numeric(region)) %>%
+  mutate(obesity = ifelse(obesity == "yes", 1, 0)) %>%
+  relocate(obesity, .before = charges)
+
+head(insurance_clean)
+
+```
+
+Alright - recoding completed. We may run into an issue with recoding of our region given they don't have a logical order to them, but we'll go ahead and proceed and deal with that at a later part if it seems to be an issue.
+
+## **Taking a Look at Correlations**
+
+Next, I'm curious about how our variables correlate with each other. This will help determine what variables might be most important in our eventual predictions of charges, but also will help us in the general data investigation aspect of this project.
+
+```{r}
+
+corr_mat <- round(cor(insurance_clean), 4)
+
+get_lower_tri<-function(corr_mat) { 
+  
+    corr_mat[upper.tri(corr_mat)] <- NA
+    
+    return(corr_mat)
+    
+}
+
+
+lower_tri <- get_lower_tri(corr_mat)
+
+melted_corrmat <- melt(lower_tri, na.rm = TRUE)
+
+corr_plot <- ggplot(data = melted_corrmat, aes(x=Var1, y=Var2, fill=value)) + 
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                       midpoint = 0, limit = c(-1,1), space = "Lab", 
+                       name="Pearson\nCorrelation") +
+  theme_minimal()+ 
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+        size = 12, hjust = 1))+
+ coord_fixed()
+
+ corr <- corr_plot +
+  theme(axis.title.x = element_blank(), axis.title.y = element_blank())
+
+ corr
+ 
+#ggsave("corr_medical.jpeg")
+
+```
+
+So, it doesn't seem like *every* variable in this dataset is going to be super important to predicting charges, but there are some key takeaways here:
+
+* Smoker status seems to be the most correlated with medical costs, where if an individual is a smoker, they are more likely to spend more on medical costs, on average.
+* Bmi, obesity and age are slightly, positively correlated with charges. So, if an individual has a higher bmi, or is older, we expect them to be spending more on medical costs, on average.
+* Sex is slightly, negatively correlated with medical costs. Given I assigned females to 1 and males to 0, this shows that females tend to spend less on medical costs, on average.
+* The region someone is in doesn't seem to be correlated much at all with medical costs.
+
+Some interesting takeaways here. This gives me a few ideas of visualizations to investigate this a bit further.
+
+# **Data Visualizations**
+
+To start, I simply want to see how our potential predictors are distributed. Given our main goal of predicting, we want normality in these variables, but it will also simply be interesting to see how many individuals fall within each category, or how numerical variables are spread out.
+
+## **Histograms & Barcharts of Categorical Data**
+
+We'll start out taking a look at our numeric variables to see how they distribute.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+
+ggplot(data = insurance_raw, aes(x = charges)) +
+  geom_histogram(aes(y=..density..), colour="black", fill="white") +
+  geom_density(alpha = .2, fill = "#FF6666") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank())
+
+ggsave("charge_medical.jpeg")
+
+ggplot(data = insurance_raw, aes(x = age)) +
+  geom_histogram(aes(y=..density..), colour="black", fill="white") +
+  geom_density(alpha = .2, fill = "#FF6666") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank())
+
+ggsave("age_medical.jpeg")
+
+ggplot(data = insurance_raw, aes(x = bmi)) +
+  geom_histogram(aes(y=..density..), colour="black", fill="white") +
+  geom_density(alpha = .2, fill = "#FF6666") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank())
+
+ggsave("bmi_medical.jpeg")
+
+ggplot(data = insurance_raw, aes(x = children)) +
+  geom_histogram(aes(y=..density..), colour="black", fill="white") +
+  geom_density(alpha = .2, fill = "#FF6666") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank())
+```
+
+We see that medical charges tend to be on the lower end (most below ~$15,000), but there are a decent amount of medical costs on the higher end, ranging up to around $50,000. Ages seem to be fairly, evenly distributed, ranging from 18 years old up to around 65 years old. As we saw before, BMI is pretty much a normal distribution, and we're seeing around half of those in our dataset having obesity. And finally, we see that the majority of individuals in this dataset don't have any children, where each additional child has a lower and lower count of individuals. 
+
+Interesting. Not much to go on from here, but let's look at our categorical variables next.
+
+```{r}
+
+ggplot(data = insurance_raw, aes(x = smoker, fill = smoker)) +
+  geom_bar() +
+  theme_minimal()
+
+ggsave("smoker_medical.jpeg")
+
+ggplot(data = insurance_raw, aes(x = sex, fill = sex)) +
+  geom_bar() +
+  theme_minimal()
+
+ggplot(data = insurance_raw, aes(x = region, fill = region)) +
+  geom_bar() +
+  theme_minimal()
+
+ggplot(data = insurance_raw, aes(x = obesity, fill = obesity)) +
+  geom_bar() +
+  theme_minimal()
+
+ggsave("obesity_medical.jpeg")
+```
+
+So, it sppears most of those in this dataset are not smokers. We also have a fairly even distribution of males and females, as well as across the four regions in our data. Lastly, it actually appears that more than HALF of individuals could be categorized as having obesity. Now, let's take a deeper look at some of the relationships we say with medical charges with visualizations.
+
+## **Investigating Relationships with Visualizations**
+
+### **Smoking Status and Medical Charges**
+
+First, let's simply see how much smokers and non-smokers are paying in medical charges.
+
+```{r}
+ggplot(data = insurance_raw, aes(x = smoker, y = charges, fill = smoker)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  theme_minimal()
+
+ggsave("smoke_charge_medical.jpeg")
+```
+
+Wow... Even though smokers make up much less of our data, they actually are paying MORE than non-smokers. Just from this alone, it seems like being a smoker may lead you to pay much more for medical expenses. Now, let's see if other categorical variables tend to play a role here.
+
+```{r}
+ggplot(data = insurance_raw, aes(x = smoker, y = charges, fill = sex)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  theme_minimal()
+
+ggplot(data = insurance_raw, aes(x = smoker, y = charges, fill = region)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  theme_minimal()
+
+ggplot(data = insurance_raw, aes(x = smoker, y = charges, fill = obesity)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  theme_minimal()
+
+```
+
+Very interesting. So smokers of different genders pay about the same and those in different regions pay about the same. This can also be said for non-smokers.
+
+The most interesting take-away here is that smokers and non-smokers who are not classified as obese seem to pay roughly the same (although, there are many more smokers, so they most likely spend more), but those who are obese AND smokers pay waaay more than those who are obese and non-smokers.
+
+So, it appears there is some interaction between smokers and obesity that may lead to to these much larger costs - something we'll want to take into account when it comes to our prediction model.
+
+### **Age and Medical Charges**
+
+Next, let's look at various ages and their medical charges. We say age was positively correlated with medical charges, so we'd expect to see those who are older tending to pay more for medical expenses, on average.
+
+```{r}
+
+ggplot(data = insurance_raw, aes(x = age, y = charges)) +
+  geom_point(color = "blue") +
+  geom_smooth(method = lm, se = FALSE, fullrange = TRUE, color = "black") +
+  theme_minimal()
+```
+
+Yep. We see a clear, positive correlation here. This graph does look interesting, however. There seems to be some groupings that are linearlly correlated with each other. We'll have to add some additional variables here to see if any variable is associated with this grouping.
+
+```{r}
+ggplot(data = insurance_raw, aes(x = age, y = charges, color = smoker)) +
+  geom_point() +
+  geom_smooth(method = lm, se = FALSE, fullrange = TRUE) +
+  theme_minimal()
+
+ggplot(data = insurance_raw, aes(x = age, y = charges, color = sex)) +
+  geom_point() +
+  geom_smooth(method = lm, se = FALSE, fullrange = TRUE) +
+  theme_minimal()
+
+ggplot(data = insurance_raw, aes(x = age, y = charges, color = region)) +
+  geom_point() +
+  geom_smooth(method = lm, se = FALSE, fullrange = TRUE) +
+  theme_minimal()
+
+ggplot(data = insurance_raw, aes(x = age, y = charges, color = obesity)) +
+  geom_point() +
+  geom_smooth(method = lm, se = FALSE, fullrange = TRUE) +
+  theme_minimal()
+```
+
+Looks like there isn't much separation between regions or sex. But, we do see some solid separation between obesity and a LARGE separation for smokers and non-smokers. This seems to match our barplot that showed smokers tend to spend much more than non-smokers, and that those with obesity tend to spend more than those who are not obese. However, we say a very interesting plot previously, that showed smokers who are obese tend to spend the most on medical. Let's create a graph that breaks down smokers and obesity to see if we can see any additional separations.
+
+```{r}
+ggplot(data = insurance_raw, aes(x = age, y = charges, color = smoker, shape = obesity)) +
+  geom_point() +
+  scale_shape_manual(values=c(3, 17))+
+  geom_smooth(method = lm, se = FALSE, fullrange = TRUE) +
+  theme_minimal()
+
+ggsave("smoke_obesity_age_charge_medical.jpeg")
+```
+Alright, let's digest this. It seems like, regardless of your obesity status, non-smokers simply do not tend to spend much on medical expenses (with some exceptions). We see that those who are not obese, but are smokers, cause a significant jump in medical charges, but tend to spend more as they age at roughly the same rate as those who are not smokers. 
+
+The more interesting take away here - those who are obese and smokers tend to spend the most, at around the same rate as the other groupings. 
+
+What does this mean? Well, smoking causes one to spend much more on medical charges, but if you are obese and a smoker, your expenditures are VERY high, much higher than those who are non-smokers and those who are smokers but not obese. It appears that smoking leads to higher medical expenditures, obesity can (but not always) lead to higher medical expenditures, but if you are a smoker and obese, you can expect to have some pretty significant costs compared to others.
+
+### **Age and Medical Charges**
+
+Now, let's look at BMI. We say BMI positively correlated with medical charges from our correlation matrix, but let's visualize that.
+
+```{r}
+
+ggplot(data = insurance_raw, aes(x = bmi, y = charges)) +
+  geom_point(color = "blue") +
+  geom_smooth(method = lm, se = FALSE, fullrange = TRUE, color = "black") +
+  theme_minimal()
+```
+
+Looks to be expected, however, we see another separation in our data here. We'll approach this similarly as we did with age and add some other variable into the mix to see if we can find this separation.
+
+```{r}
+ggplot(data = insurance_raw, aes(x = bmi, y = charges, color = smoker)) +
+  geom_point() +
+  geom_smooth(method = lm, se = FALSE, fullrange = TRUE) +
+  theme_minimal()
+
+ggsave("smoke_bmi_charge_medical.jpeg")
+
+ggplot(data = insurance_raw, aes(x = bmi, y = charges, color = sex)) +
+  geom_point() +
+  geom_smooth(method = lm, se = FALSE, fullrange = TRUE) +
+  theme_minimal()
+
+ggplot(data = insurance_raw, aes(x = bmi, y = charges, color = region)) +
+  geom_point() +
+  geom_smooth(method = lm, se = FALSE, fullrange = TRUE) +
+  theme_minimal()
+
+```
+
+Alright, another interesting set of visuals. Again, we're seeing that age and region don't seem to play a row in BMIs relationship with medical charges. However, we again see that smoking status plays an additional role, now with BMI and charges. It appear that, if you are a non-smoker, an increase in BMI leads to only a slight increase in medical charges, but no by much. However, if you are a smoker, having an increase in BMI is leading to a LARGE increase in charges.
+
+We actually see that those with very low BMIs, regardless of smoking or not, have pretty similar medical expenses. However, as your BMI increases when you're also a smoker, your medical expenses increase significantly. 
+
+Just for curiousity sake, let's see if there is some relationship between age and BMI.
+
+### **Age and BMI**
+
+```{r}
+ggplot(data = insurance_raw, aes(x = age, y = bmi)) +
+  geom_point(color = "blue") +
+  geom_smooth(method = lm, se = FALSE, fullrange = TRUE, color = "black") +
+  theme_minimal()
+```
+
+Doesn't appear like there is much here. Maybe a slight increase in BMI as you age, but BMI tends to stay pretty constant through our age groups.
+
+Let's take one final look at how medical expenses are distributed across various levels of our data.
+
+### **Violin Plots of Medical Charges Across Smoking Status, Sex, Region and Obesity**
+
+```{r}
+ggplot(data = insurance_raw, aes(x = smoker, y = charges, fill = smoker)) +
+  geom_violin() +
+  theme_minimal()
+
+ggsave("smoker_medical.jpeg")
+
+ggplot(data = insurance_raw, aes(x = sex, y = charges, fill = sex)) +
+  geom_violin() +
+  theme_minimal()
+
+ggplot(data = insurance_raw, aes(x = region, y = charges, fill = region)) +
+  geom_violin() +
+  theme_minimal()
+
+ggplot(data = insurance_raw, aes(x = obesity, y = charges, fill = obesity)) +
+  geom_violin() +
+  theme_minimal()
+
+ggsave("obesity_medical.jpeg")
+```
+
+This seems to reiterate what we've seen, but again shows solid separation between smokers and non-smokers and their medical expenses, as well as a grouping of additional expenses amongst those who are classified as obese.
+
+Alright, time to move onto our model creation and predictions!
+ 
+# **Model Creation and Predictions**
+
+For this part, we'll work on building the best model we can, and then use that model to predict medical charges. First step is working on our model!
+
+## **Model Creation**
+
+Before creating our model, we'll want to address some needed assumptions: no multicollinearity and multivariate normality.
+
+### **Multicollinearity Check**
+
+In essence, we want our predictor variables to be highly correlated with our variable we want to predict (medical charges), but we don't want those variables to be correlated with each other (known as multicollinearity).
+
+There's a quick way to check this in R. First, we'll force a reduced linear model using all of our predictors. We can then find the Variance Inflation Factor (VIF) of each variable to determine if there is a severe level of correlation between them. We want a VIF less than 5 for each variable, and if that's the case, we're rockin' and rollin'.
+
+```{r}
+reduced_model <- lm(charges ~ age + bmi + sex + children + smoker + region + obesity, data = insurance_clean)
+
+car::vif(reduced_model)
+```
+Woohoo! All VIF values are looking good, so we've met the assumption that there is no multicollinearity present in our model. Next, we'll look into multivariate normality.
+
+### **Multivariate Normality Check**
+
+We need to check if our residuals are normally distributed, otherwise known as Multivariate Normality. There's a simple package in R that allows us to make a quick check.
+
+```{r}
+
+mvn <- mvn(data = insurance_clean, mvnTest = "hz")
+
+print(mvn$multivariateNormality)
+```
+
+Well, looks like (from the last column), that our data does not meet this assumption. We previously saw that the age variable wasn't really normally distributed, so this may be our issue. Let's take a look at the qqplots for our numeric data to see if we're running into this issue for a specific variable.
+
+```{r}
+qqPlot(insurance_clean$age)
+qqPlot(insurance_clean$bmi)
+qqPlot(insurance_clean$children)
+```
+As expected, it seems like age is the culprit here. To deal with this, I'll simply add a squared version of the variable to our data account for the lack of linearity present here. This isn' the perfect solution, but should give us some additional help when it comes to predicting.
+
+```{r}
+insurance_clean$age2 <- (insurance_clean$age)^2
+```
+
+Alright, assumptions are dealt with, now time to move onto creating our model!
+
+## **Reduced model**
+
+We already created a reduced moodel to check for multicollinearity, and we don't need to remove any variables to continue with this model based on our assumptions being met. Now, let's take a look at our reduced model and how well it's doing.
+
+```{r}
+summary(reduced_model)
+```
+This is pretty good! Even though we haven't made any adjustments, we're already getting an Adjusted R-Squared value of 0.7545, which indicated we're capturing a pretty large portion of medical charges with this information. We see that sex is not really a super strong variable for modeling medical charges, and region is only slightly significant. However, age, BMI, number of children smoker status and obesity are very significant, and we'll definitely want to consider them in a final model. Now, let's add some interactions and our squared age term to see how the model performs.
+
+## **Full Model**
+
+Given age was an issue in it's residual normality, we'll want to add a squared version of the variable to help with our assumptions. We also saw an interesting interaction between smoking and obesity in our visualizations, where being a smoker and obese led to much higher medical charges. To account for this interaction, we'll add an additional variable to our model where we multiple smoking status and obesity status together so we can have a slope measure for when an individual is a smoker and obese simultaneously.
+
+```{r}
+full_model <- glm(charges ~ age + age2 + bmi + sex + children + smoker + region + obesity + obesity*smoker, data = insurance_clean)
+summary(full_model)
+```
+
+### **Comparing Models with ANOVA**
+
+Even though it seems like the full model is performing better, let's be statistically sound and properlly compare the two models with an Analysis of Covariance (ANOVA) Chi-Square test. This test will help us determine if the added variables in the full model are significantly improve our reduced model.
+
+```{r}
+anova(reduced_model, full_model, test = "Chisq")
+```
+Here we see a veeeery small p-value, which indicates that our full model is performing significantly better than our reduced model! Perfect, we can now move on to train our model to make some predictions.
+
+# **Predicting Medical Expenses**
+
+To predict medical expenses, we'll want to first split our data into "train" and "test" data. By doing this, we'll be able to employ our model onto a train dataset, make predictions with that data, then test the accuracy of our predictions of our test dataset. This helps us ensure that the data we're predicting isn't coming straight from the data we build our model upon.
+
+We'll approach this training with a Cross Validation, where we'll split up our training dataset into four parts, 3 to train with and 1 to test with. This will help make sure there isn't a specific subset of the data we train with that varies significantly from the test data.
+
+## **Training model**
+
+First we'll split our data, then we'll use our full model previously obtained to train our model. 
+
+```{r}
+
+train <- trainControl(method = "cv", number = 4)
+
+
+mod2 <- train(charges ~ age + age^2 + bmi + sex + children + smoker + region + obesity + obesity*smoker, data = insurance_clean, method = "lm", trControl = train)
+
+print(mod2)
+
+```
+
+Alright, we obtained a pretty large R-Squared here! Looking like we have some pretty solid prediction potential, although not perfect. Now it's time for predicting!
+
+## **Predicting Medical Charges**
+
+First, we can use our full model to make predictions of medical charges, then visualize those predictions against our true medical charges. Then, we can investigate the accuracy of our predictions more precisely outside of simple visualizations.
+
+### **Visualizing Predictions**
+
+```{r}
+
+insurance_clean$index <- 1:nrow(insurance_clean)
+
+insurance_train <- insurance_clean %>% dplyr::sample_frac(0.7) #split 70% of our data into a training data to train predictions
+insurance_test <- dplyr::anti_join(insurance_clean, insurance_train, by="index") #join the remainder of the dataset into a test data to see how predicitons fair
+
+insurance_train <- insurance_train %>% dplyr::select(-index)
+insurance_test <- insurance_test %>% dplyr::select(-index)
+
+
+
+insurance_predicted <- insurance_test %>%
+  mutate(predicted_charges = predict(full_model, newdata = insurance_test)) %>%
+  rename("true_charges" = "charges")
+
+ggplot(data = insurance_predicted, aes(x = true_charges, y = predicted_charges)) +
+  geom_point() +
+  geom_smooth(method = lm, se = FALSE, fullrange = TRUE) +
+  theme_minimal()
+
+ggsave("pred_medical.jpeg")
+```
+
+Well, this is looking pretty good! We see that, particularly for lower expenses, we can predict charges fairly well. For middle-of-the-road expenses, it seems like we either very slightly over or largely under predict medical charges, and typically over-predict larger medical expenses. Overall, this seems to be fairly good at predicting specially lower charges.
+
+# **Summary**
+
+So what have we learned? Well, we discovered that there are many important factors when it comes to predicting medical charges for an individual. An individual's sex, age, bmi, smoking status, region, number of children and obesity status all seem to be important predictors of an individuals medical charges. We further found that, those who smoke simply spend much more on medical, on average. Coupling smoking with obesity creates one of the largest risk factors for large medical expenses than any other factor. Even though age and bmi were found to be correlated and important predictors of medical expenses, if you are a smoker, you will be spending much more on medical, especially if you are additionally obese. 
+
+Overall, we've build a model that help predict expenses fairly well, especially determining expenses of those who have lower medical charges. Potentially some additional information could help with the middle-range charges!
+
+
+
+
+
+
+
+
+
+
+
+
+
